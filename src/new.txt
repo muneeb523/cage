@@ -1,0 +1,447 @@
+/**
+ * @file main.c
+ * @brief I2C communication and data processing with NRF microcontroller.
+ *
+ * This code communicates with an AVR device using I2C to retrieve sensor data 
+ * and hub information. It periodically sends commands to the device, verifies
+ * data integrity using CRC-16-CCITT and CRC-8, and processes the received data.
+ *
+ * @version 1.2
+ * @date 2024
+ */
+
+#include <zephyr/kernel.h>           ///< Zephyr kernel header
+#include <zephyr/drivers/i2c.h>     ///< I2C driver header
+#include <stdio.h>                   ///< Standard I/O header
+#include <stdlib.h>                  ///< Standard library header
+//#include <zephyr/power/power.h>    ///< For sleep functionality (commented out)
+#include <zephyr/sys/printk.h>       ///< Printk for logging
+#include <zephyr/sys/byteorder.h>    ///< Byte order manipulation functions
+#include <zephyr/device.h>           ///< Device management header
+#include <zephyr/zephyr.h>
+#include <cJSON.h>                   ///< cJSON library for JSON handling
+#include <cJSON_os.h>
+
+#include <zephyr/logging/log.h>       ///< Logging header for structured logging
+#include <zephyr/drivers/gpio.h>     ///< GPIO driver header
+
+#include <zephyr/drivers/watchdog.h>  ///< Watchdog timer header
+
+#ifndef WDT_MAX_WINDOW
+#define WDT_MAX_WINDOW  30000U
+#endif
+
+// Definitions
+#define I2C0_NODE      DT_NODELABEL(avr_device)
+#define NUM_SENSORS    16  ///< Maximum number of sensors
+#define SENSOR_DATA_SIZE sizeof(SensorData)
+#define HUB_INFO_SIZE  10  ///< Updated to 10 bytes based on new hub info structure
+#define MAX_RETRIES    2 ///< Retry for CRC mismatches
+#define HEARTBEAT_PERIOD_S 30  ///< Heartbeat interval in seconds
+// I2C slave address from the device tree
+#define I2C_SLAVE_ADDRESS  DT_REG_ADDR(DT_NODELABEL(avr_device))
+
+static const struct device *wdt = DEVICE_DT_GET(DT_NODELABEL(wdt0));
+
+// bUFFER TO READ DATA SENSOR DATA 
+#define Buffer_Size 170
+// Enum for command codes
+typedef enum {
+    CMD_GET_SAMPLES_ALL = 0x01,
+    CMD_GET_HUB_INFO = 0x02,
+    CMD_GET_SAMPLES = 0x03,
+    CMD_GET_SAMPLES_SPECIFIC = 0x04
+} CommandCode;
+
+/**
+ * @brief Struct to hold sensor data.
+ */
+typedef struct {
+    uint64_t Serial_no;  ///< Sensor serial number
+    uint16_t range;      ///< Sensor range data
+} __attribute__((packed)) SensorData;
+
+/**
+ * @brief Struct to hold hub info.
+ */
+typedef struct {
+    uint8_t firmware_version;
+    uint8_t hardware_version;
+    uint8_t reserved[2];           // Reserved bytes
+    uint8_t exp_firmware_version;
+    uint8_t exp_hardware_version;
+    uint16_t sensor_presence_bits;  // 16 bits to represent presence of sensors
+    uint8_t reserved_2[2];          // More reserved bytes
+} __attribute__((packed)) HubInfo;
+/**
+ * @brief Buffer to hold Sensor Data 
+ */
+uint8_t buffer[Buffer_Size];
+/**
+ * @brief Sensors Array to hold Sensor Data 
+ */
+SensorData sensor_data[NUM_SENSORS];
+/**
+ * @brief CRC-16-CCITT calculation.
+ * @param data Pointer to the data array.
+ * @param length Length of the data.
+ * @return Calculated CRC-16 value.
+ */
+uint16_t calculateCRC16CCITT(uint8_t *data, size_t length) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < length; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (uint8_t j = 0; j < 8; j++) {
+            if (crc & 0x8000) {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+/**
+ * @brief Send command, payload, and CRC-8 to AVR.
+ * @param i2c_dev I2C device structure.
+ * @param cmd Command to send.
+ * @param payload Payload to send.
+ * @return I2C write status.
+ */
+int send_command(const struct i2c_dt_spec *i2c_dev, CommandCode cmd, uint8_t payload) {
+    uint8_t command[2] = { cmd, payload};
+    return i2c_write_dt(i2c_dev, command, sizeof(command));
+}
+
+/**
+ * @brief Read generic data from AVR.
+ * @param i2c_dev I2C device structure.
+ * @param data Buffer to store the data.
+ * @param size Size of data to read.
+ * @return I2C read status.
+ */
+int read_generic_data(const struct i2c_dt_spec *i2c_dev, void *data, size_t size) {
+    return i2c_read_dt(i2c_dev, (uint8_t *)data, size);
+}
+
+/**
+ * @brief Link buffer data to sensor data structure and extract CRC.
+ *
+ * This function copies data from the provided buffer into the sensor data array
+ * and extracts the CRC value from the end of the buffer. It also clears the buffer
+ * after processing to avoid accidental reuse of stale data.
+ *
+ * @param Buffer Pointer to the input buffer containing sensor data and CRC.
+ * @param sensor_data Pointer to the array of SensorData structures to fill.
+ * @param crc Pointer to store the extracted CRC value.
+ */
+uint16_t linkBufferToSensorData(uint8_t *buffer, SensorData *sensor_data, size_t data_size) {
+    // Check for null pointers
+    if (buffer == NULL || sensor_data == NULL) {
+        printk("Error: Null pointer passed to linkBufferToSensorData.\n");
+        return 0; // Consider defining a specific error code
+    }
+    
+    // Ensure the data size is appropriate
+    if (data_size < 2 || data_size > Buffer_Size) {
+        printk("Error: Invalid data size passed to linkBufferToSensorData: %zu\n", data_size);
+        return 0; // Error code for invalid size
+    }
+
+    // Copy sensor data
+    memcpy(sensor_data, buffer, data_size - 2); // Copy the first data_size - 2 bytes
+
+    // Extract and compute CRC
+    uint16_t crc = (buffer[data_size - 2] << 8) | buffer[data_size - 1];
+    printk("CRC: 0x%04X\n", crc);
+
+    // Clear buffer to avoid stale data
+    memset(buffer, 0, data_size); // Clear the entire buffer
+
+    return crc; // Return the computed CRC
+}
+
+/**
+ * @brief Receive and validate data from AVR with CRC-16-CCITT.
+ * @param i2c_dev I2C device structure.
+ * @param data Buffer to store the received data.
+ * @param data_size Size of the data to read.
+ * @param calculated_crc Pointer to store the calculated CRC.
+ * @return True if data is valid, otherwise false.
+ */
+bool receive_and_validate_data(const struct i2c_dt_spec *i2c_dev, void *data, size_t data_size, uint16_t *calculated_crc) {
+    int ret = read_generic_data(i2c_dev, data, data_size);
+    if (ret) {
+        printk("I2C: Failed to read data (error %d).\n", ret);
+        return false;
+    }
+
+    k_msleep(1);  ///< Small delay before reading CRC
+
+    uint16_t received_crc;
+    ret = read_generic_data(i2c_dev, &received_crc, sizeof(received_crc));
+    if (ret) {
+        printk("I2C: Failed to read CRC (error %d).\n", ret);
+        return false;
+    }
+
+    printk("Received CRC: 0x%04X\n", received_crc);
+    *calculated_crc = calculateCRC16CCITT((uint8_t *)data, data_size);
+    printk("Calculated CRC: 0x%04X\n", *calculated_crc);
+    return (received_crc == *calculated_crc);
+}
+
+/**
+ * @brief Receive and validate Sensors data from AVR  with CRC-16-CCITT.
+ * @param i2c_dev I2C device structure.
+ * @param data Buffer to store the received data.
+ * @param data_size Size of the data to read.
+ * @param expected_crc  Pointer to store the calculated CRC.
+ * @return True if data is valid, otherwise false.
+ */
+bool receive_and_validate_data_Sensors(const struct i2c_dt_spec *i2c_dev, void *data, size_t data_size, uint16_t *expected_crc) {
+    // Read data from I2C
+    int ret = read_generic_data(i2c_dev, data, data_size);
+    if (ret) {
+        printk("I2C: Failed to read data (error %d).\n", ret);
+        return false; // Return false on error
+    }
+
+    k_msleep(1); // Small delay before reading CRC
+
+    // Process the received data and CRC
+    uint16_t received_crc = linkBufferToSensorData(buffer, sensor_data, data_size);
+    printk("Received CRC: 0x%04X\n", received_crc);
+
+    // Calculate expected CRC
+    *expected_crc = calculateCRC16CCITT((uint8_t *)sensor_data, data_size - 2);
+    printk("Calculated CRC: 0x%04X\n", *expected_crc);
+
+    // Validate CRC
+    return (received_crc == *expected_crc);
+}
+
+
+/**
+ * @brief Process received sensor data.
+ * @param sensor_data Pointer to the sensor data array.
+ * @param num_sensors Number of active sensors to process.
+ */
+void process_sensor_data(SensorData *sensor_data, int num_sensors) {
+    for (int i = 0; i < num_sensors; i++) {
+        printk("Serial Number: %llu, Range: %d\n", sensor_data[i].Serial_no, sensor_data[i].range);
+    }
+    printk("Total Sensor Data Received: %d bytes\n", SENSOR_DATA_SIZE * num_sensors);
+}
+
+/**
+ * @brief Process received hub information and return sensor presence bits.
+ * @param hub_info Pointer to the hub info structure.
+ * @return Sensor presence bits as a uint16_t.
+ */
+uint16_t process_hub_info(HubInfo *hub_info) {
+    printk("Hub Firmware Version: %d\n", hub_info->firmware_version);
+    printk("Hub Hardware Version: %d\n", hub_info->hardware_version);
+    printk("Expansion Hub Firmware Version: %d\n", hub_info->exp_firmware_version);
+    printk("Expansion Hub Hardware Version: %d\n", hub_info->exp_hardware_version);
+
+    printk("Sensor Presence Bits: 0x%04X\n", hub_info->sensor_presence_bits);
+    return hub_info->sensor_presence_bits;
+}
+
+/**
+ * @brief Count the number of active sensors based on the sensor presence bits.
+ * @param sensor_presence_bits Bitfield indicating which sensors are active.
+ * @return The number of active sensors.
+ */
+int count_active_sensors(uint16_t sensor_presence_bits) {
+    int count = 0;
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        if (sensor_presence_bits & (1 << i)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+// Forward declaration of work handler
+static void heartbeat_work_fn(struct k_work *work);
+
+// Declare work structure
+static struct k_work_delayable heartbeat_work;
+static K_SEM_DEFINE(sampling_started, 0, 1);  ///< Semaphore for synchronization
+
+/**
+ * @brief Initialize work functions.
+ */
+static void work_init(void) {
+    k_work_init_delayable(&heartbeat_work, heartbeat_work_fn);
+}
+/**
+ * @brief Going to Sleep Mode 
+ */
+static void GO_TO_SLEEP(int ID){
+    printk("GOING TO SLEEP TILL NEXT HEARBEAT IS TRIGGERED \n");
+    k_work_schedule(&heartbeat_work, K_SECONDS(HEARTBEAT_PERIOD_S));
+   wdt_feed(wdt, ID);
+
+
+
+
+}
+/**
+ * @brief Heartbeat work function to be triggered periodically.
+ * @param work Pointer to the work structure.
+ */
+static void heartbeat_work_fn(struct k_work *work) {
+    printk("Heartbeat timer triggered!\n");
+    k_sem_give(&sampling_started);  ///< Unblock the main loop
+}
+
+/**
+ * @brief Main entry function.
+ */int main(void) {
+    int err;
+    int ret;
+    HubInfo hub_info;
+    uint16_t calculated_crc;
+    uint16_t sensor_presence_bits;
+    
+	if (!device_is_ready(wdt) || wdt == NULL)
+	{
+		//LOG_ERR("Watchdog device not ready");
+		return -EIO;
+	}
+
+	struct wdt_timeout_cfg wdt_config = 
+	{
+		/* Reset SoC when watchdog timer expires. */
+		.flags = WDT_FLAG_RESET_SOC,
+
+		/* Expire watchdog after max window */
+		.window.min = 0U,
+		.window.max = WDT_MAX_WINDOW
+	};
+
+	int wdt_channel_id = wdt_install_timeout(wdt, &wdt_config);
+	if (wdt_channel_id < 0)
+	{
+		//LOG_ERR("Watchdog install error.");
+		return wdt_channel_id;
+	}
+
+	//Pause watchdog timer when CPU is halted by the debugger. 
+	err = wdt_setup(wdt, WDT_OPT_PAUSE_IN_SLEEP);
+
+    cJSON_Init();
+    // Initialize work functions
+    work_init();
+
+    // Get the I2C device structure from the device tree
+    const struct i2c_dt_spec i2c_dev = I2C_DT_SPEC_GET(I2C0_NODE);
+
+    // Check if the I2C device is ready
+    if (!device_is_ready(i2c_dev.bus)) {
+        printk("I2C bus %s is not ready!\n", i2c_dev.bus->name);
+        return;
+    }
+
+    // Schedule the first heartbeat
+    k_work_schedule(&heartbeat_work, K_SECONDS(HEARTBEAT_PERIOD_S));
+
+    while (1) {
+        printk("HOOOOOOOOOOOOOOOOOOOOOOO\n");
+
+        
+        // Wait for heartbeat timer
+        k_sem_take(&sampling_started, K_FOREVER);
+
+        printk("Sending hub info request...\n");
+       int  retr=0; // Reset retries for new command
+        while (retr < MAX_RETRIES) {
+            ret = send_command(&i2c_dev, CMD_GET_HUB_INFO, 0x00);  // Request hub info
+            if (ret) {
+                printk("I2C: Failed to send hub info command (error %d).\n", ret);
+                retr++;
+                continue; // Retry sending the command
+            }
+
+        k_sleep(K_SECONDS(2)); 
+
+            if (receive_and_validate_data(&i2c_dev, &hub_info, HUB_INFO_SIZE, &calculated_crc)) {
+                break; // Successful validation, exit retry loop
+            } else {
+                printk("Data validation failed for hub info. Retry...\n");
+                process_hub_info(&hub_info);
+                 k_sleep(K_SECONDS(15)); 
+                retr++;
+            }
+        }
+
+        if (retr == MAX_RETRIES) {
+            printk("Max retries reached for hub info. Sleeping until next heartbeat...\n");
+            GO_TO_SLEEP(wdt_channel_id); // Sleep until the next heartbeat
+            continue; // Skip the rest of the loop
+        }
+
+        // Process hub info and get sensor presence bits
+        sensor_presence_bits = process_hub_info(&hub_info);
+        int num_active_sensors = count_active_sensors(sensor_presence_bits);
+        printk("Number of active sensors: %d\n", num_active_sensors);
+
+        // Send only the sensor presence bits to the cloud
+        printk("Sending sensor presence bits (0x%04X) to cloud...\n", sensor_presence_bits);
+      
+	    	k_sleep(K_SECONDS(5));
+        // Proceed to get sensor samples only if sensors are present
+        if (num_active_sensors > 0) {
+
+            ret = send_command(&i2c_dev, CMD_GET_SAMPLES_ALL, 0x00);  // Request sensor samples
+            if (ret) {
+                printk("I2C: Failed to send sample command (error %d).\n", ret);
+                continue; // Continue to the next iteration
+            }
+
+           // blocking wait of 5s to ensure publish is completed
+	         	k_sleep(K_SECONDS(10));// Wait for data to be ready
+
+             int   retri = 0;
+            while (retri < MAX_RETRIES) {
+
+                ret = send_command(&i2c_dev, CMD_GET_SAMPLES, 0x00);  // Request sensor samples
+                if (ret) {
+                    printk("I2C: Failed to send sample command (error %d).\n", ret);
+                    continue; // Retry sending the command
+                }
+
+                k_sleep(K_SECONDS(2));
+                uint8_t SIZE=(num_active_sensors * SENSOR_DATA_SIZE )+2;
+                if (receive_and_validate_data_Sensors(&i2c_dev, buffer,  SIZE , &calculated_crc)) {
+                    // Data validation successful, process the sensor data
+                    process_sensor_data(sensor_data, num_active_sensors);
+                    break; // Exit the retry loop
+                } else {
+                    
+                    printk("Data validation failed for sensor data. Retry...\n");
+                    process_sensor_data(sensor_data, num_active_sensors);
+                    k_sleep(K_SECONDS(10));
+                    
+                    retri++;
+                }
+            }
+
+            if (retri == MAX_RETRIES) {
+                printk ("retries : %d ",retri );
+                printk("Max retries reached for sensor data. Sleeping until next heartbeat...\n");
+                GO_TO_SLEEP(wdt_channel_id);  // Sleep until the next heartbeat
+                continue; // Skip the rest of the loop
+            }
+        }
+
+        // Reschedule the next heartbeat
+         GO_TO_SLEEP(wdt_channel_id);
+        	
+
+    }
+}

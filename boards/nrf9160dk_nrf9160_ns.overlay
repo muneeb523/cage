@@ -1,0 +1,13 @@
+arduino_i2c: &i2c2 {
+	compatible = "nordic,nrf-twim";
+	status = "okay";
+	pinctrl-0 = <&i2c2_default>;
+	pinctrl-1 = <&i2c2_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	avr_device: avr@55 {
+		compatible = "i2c-device";
+		reg = <0x55>;
+		label = "AVR_Device";
+	};
+};
